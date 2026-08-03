@@ -1,3 +1,5 @@
+@file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+
 package com.example.browsemyphone
 
 import android.Manifest
@@ -9,6 +11,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.Settings
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -25,6 +28,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -36,34 +40,46 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.Android
+import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.AudioFile
 import androidx.compose.material.icons.filled.ChevronRight
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DataUsage
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.DriveFileMove
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderOff
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.FolderZip
 import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.SdCard
 import androidx.compose.material.icons.filled.Smartphone
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -73,6 +89,8 @@ import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -88,7 +106,9 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.browsemyphone.ui.theme.BrowseMyPhoneTheme
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.util.Locale
 
 class MainActivity : ComponentActivity() {
@@ -104,7 +124,7 @@ class MainActivity : ComponentActivity() {
 }
 
 // ---------------------------------------------------------------------------
-// Navigation
+// Navigation & shared state
 // ---------------------------------------------------------------------------
 
 sealed interface Screen {
@@ -123,7 +143,11 @@ sealed interface Screen {
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+/** A pending copy/move operation, shown as a Paste bar when browsing a folder. */
+data class Clipboard(val entry: FileEntry, val mode: ClipMode)
+
+private enum class DialogKind { RENAME, DELETE, PROPERTIES }
+
 @Composable
 fun AppRoot() {
     val context = LocalContext.current
@@ -153,7 +177,13 @@ fun AppRoot() {
 
     val backStack = remember { mutableStateListOf<Screen>(Screen.Home) }
     val current = backStack.last()
+    var clipboard by remember { mutableStateOf<Clipboard?>(null) }
+
     BackHandler(enabled = backStack.size > 1) { backStack.removeAt(backStack.lastIndex) }
+
+    val browseTo: (String, String) -> Unit = { path, label ->
+        backStack.add(Screen.Browse(path, label.ifEmpty { path }))
+    }
 
     Scaffold(
         topBar = {
@@ -184,14 +214,17 @@ fun AppRoot() {
                     hasAccess = accessState.value,
                     onRequestAccess = requestAccess,
                     onCategory = { backStack.add(it) },
-                    onBrowseVolume = { vol -> backStack.add(Screen.Browse(vol.path, vol.label)) }
+                    onBrowseVolume = { vol -> browseTo(vol.path, vol.label) }
                 )
 
                 is Screen.Browse -> BrowseScreen(
                     path = screen.path,
                     hasAccess = accessState.value,
                     onRequestAccess = requestAccess,
-                    onOpenFolder = { backStack.add(Screen.Browse(it.path, it.name)) },
+                    clipboard = clipboard,
+                    onSetClipboard = { clipboard = it },
+                    onUp = { parent -> browseTo(parent, File(parent).name) },
+                    onOpenFolder = { browseTo(it.path, it.name) },
                     onOpenFile = { FileRepository.openFile(context, it) }
                 )
 
@@ -199,12 +232,16 @@ fun AppRoot() {
                     type = screen.type,
                     hasAccess = accessState.value,
                     onRequestAccess = requestAccess,
+                    clipboard = clipboard,
+                    onSetClipboard = { clipboard = it },
                     onOpenFile = { FileRepository.openFile(context, it) }
                 )
 
                 is Screen.BigFiles -> BigFilesScreen(
                     hasAccess = accessState.value,
                     onRequestAccess = requestAccess,
+                    clipboard = clipboard,
+                    onSetClipboard = { clipboard = it },
                     onOpenFile = { FileRepository.openFile(context, it) }
                 )
             }
@@ -262,7 +299,7 @@ fun HomeScreen(
         }
 
         Text(
-            "Storage",
+            "Storage — tap to browse files",
             style = MaterialTheme.typography.titleMedium,
             modifier = Modifier.padding(bottom = 12.dp)
         )
@@ -316,6 +353,17 @@ fun StorageCard(vol: StorageVolumeInfo, onClick: () -> Unit) {
                 )
                 Spacer(Modifier.width(10.dp))
                 Text(vol.label, style = MaterialTheme.typography.titleMedium)
+                Spacer(Modifier.weight(1f))
+                Icon(
+                    Icons.Filled.FolderOpen,
+                    contentDescription = "Browse",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Icon(
+                    Icons.Filled.ChevronRight,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
             Spacer(Modifier.height(12.dp))
             LinearProgressIndicator(
@@ -365,6 +413,9 @@ fun BrowseScreen(
     path: String,
     hasAccess: Boolean,
     onRequestAccess: () -> Unit,
+    clipboard: Clipboard?,
+    onSetClipboard: (Clipboard?) -> Unit,
+    onUp: (String) -> Unit,
     onOpenFolder: (FileEntry) -> Unit,
     onOpenFile: (FileEntry) -> Unit
 ) {
@@ -372,16 +423,26 @@ fun BrowseScreen(
         PermissionNotice(onRequestAccess)
         return
     }
-    val items by produceState<List<FileEntry>?>(initialValue = null, path) {
+    var refreshKey by remember { mutableStateOf(0) }
+    val items by produceState<List<FileEntry>?>(initialValue = null, path, refreshKey) {
         value = withContext(Dispatchers.IO) { FileRepository.listDirectory(path) }
     }
     Column(Modifier.fillMaxSize()) {
-        PathBar(path)
+        BrowsePathBar(path, onUp)
         val list = items
         when {
             list == null -> LoadingState()
-            list.isEmpty() -> EmptyState("This folder is empty")
-            else -> FileList(list, onFolderClick = onOpenFolder, onFileClick = onOpenFile)
+            list.isEmpty() && clipboard == null -> EmptyState("This folder is empty")
+            else -> FileListWithActions(
+                modifier = Modifier.weight(1f),
+                items = list ?: emptyList(),
+                currentDir = path,
+                clipboard = clipboard,
+                onSetClipboard = onSetClipboard,
+                onOpenFolder = onOpenFolder,
+                onOpenFile = onOpenFile,
+                onChanged = { refreshKey++ }
+            )
         }
     }
 }
@@ -391,6 +452,8 @@ fun MediaListScreen(
     type: MediaType,
     hasAccess: Boolean,
     onRequestAccess: () -> Unit,
+    clipboard: Clipboard?,
+    onSetClipboard: (Clipboard?) -> Unit,
     onOpenFile: (FileEntry) -> Unit
 ) {
     if (!hasAccess) {
@@ -398,14 +461,24 @@ fun MediaListScreen(
         return
     }
     val context = LocalContext.current
-    val items by produceState<List<FileEntry>?>(initialValue = null, type) {
+    var refreshKey by remember { mutableStateOf(0) }
+    val items by produceState<List<FileEntry>?>(initialValue = null, type, refreshKey) {
         value = withContext(Dispatchers.IO) { FileRepository.queryMedia(context, type) }
     }
     val list = items
     when {
         list == null -> LoadingState()
         list.isEmpty() -> EmptyState("No files found")
-        else -> FileList(list, onFolderClick = {}, onFileClick = onOpenFile)
+        else -> FileListWithActions(
+            modifier = Modifier.fillMaxSize(),
+            items = list,
+            currentDir = null,
+            clipboard = clipboard,
+            onSetClipboard = onSetClipboard,
+            onOpenFolder = {},
+            onOpenFile = onOpenFile,
+            onChanged = { refreshKey++ }
+        )
     }
 }
 
@@ -413,6 +486,8 @@ fun MediaListScreen(
 fun BigFilesScreen(
     hasAccess: Boolean,
     onRequestAccess: () -> Unit,
+    clipboard: Clipboard?,
+    onSetClipboard: (Clipboard?) -> Unit,
     onOpenFile: (FileEntry) -> Unit
 ) {
     if (!hasAccess) {
@@ -420,64 +495,230 @@ fun BigFilesScreen(
         return
     }
     val context = LocalContext.current
-    val items by produceState<List<FileEntry>?>(initialValue = null) {
+    var refreshKey by remember { mutableStateOf(0) }
+    val items by produceState<List<FileEntry>?>(initialValue = null, refreshKey) {
         val roots = FileRepository.getStorageVolumes(context).map { it.path }
             .ifEmpty { listOf(Environment.getExternalStorageDirectory().absolutePath) }
         value = FileRepository.findLargeFiles(roots, 100L * 1024 * 1024, 200)
     }
     val list = items
     Column(Modifier.fillMaxSize()) {
-        PathBar("Files larger than 100 MB")
+        InfoBar("Files larger than 100 MB")
         when {
             list == null -> LoadingState("Scanning storage…")
             list.isEmpty() -> EmptyState("No large files found")
-            else -> FileList(list, onFolderClick = {}, onFileClick = onOpenFile)
+            else -> FileListWithActions(
+                modifier = Modifier.weight(1f),
+                items = list,
+                currentDir = null,
+                clipboard = clipboard,
+                onSetClipboard = onSetClipboard,
+                onOpenFolder = {},
+                onOpenFile = onOpenFile,
+                onChanged = { refreshKey++ }
+            )
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Shared pieces
+// File list + per-item actions (copy / move / rename / delete / properties)
 // ---------------------------------------------------------------------------
 
 @Composable
-fun PathBar(text: String) {
-    Text(
-        text,
-        style = MaterialTheme.typography.bodySmall,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-        maxLines = 1,
-        overflow = TextOverflow.Ellipsis,
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(MaterialTheme.colorScheme.surfaceVariant)
-            .padding(horizontal = 16.dp, vertical = 8.dp)
-    )
-}
-
-@Composable
-fun FileList(
+fun FileListWithActions(
+    modifier: Modifier = Modifier,
     items: List<FileEntry>,
-    onFolderClick: (FileEntry) -> Unit,
-    onFileClick: (FileEntry) -> Unit
+    currentDir: String?,
+    clipboard: Clipboard?,
+    onSetClipboard: (Clipboard?) -> Unit,
+    onOpenFolder: (FileEntry) -> Unit,
+    onOpenFile: (FileEntry) -> Unit,
+    onChanged: () -> Unit
 ) {
-    LazyColumn(Modifier.fillMaxSize()) {
-        items(items, key = { it.path }) { entry ->
-            FileRow(entry) {
-                if (entry.isDirectory) onFolderClick(entry) else onFileClick(entry)
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    fun toast(m: String) = Toast.makeText(context, m, Toast.LENGTH_SHORT).show()
+
+    var sheetTarget by remember { mutableStateOf<FileEntry?>(null) }
+    var dialogKind by remember { mutableStateOf<DialogKind?>(null) }
+    var dialogTarget by remember { mutableStateOf<FileEntry?>(null) }
+
+    Column(modifier) {
+        LazyColumn(
+            Modifier
+                .weight(1f)
+                .fillMaxWidth()
+        ) {
+            items(items, key = { it.path }) { entry ->
+                FileRow(
+                    entry = entry,
+                    onClick = { if (entry.isDirectory) onOpenFolder(entry) else onOpenFile(entry) },
+                    onMore = { sheetTarget = entry }
+                )
+                HorizontalDivider()
             }
-            HorizontalDivider()
         }
+        if (currentDir != null && clipboard != null) {
+            val dir: String = currentDir
+            val clip: Clipboard = clipboard
+            PasteBar(
+                clipboard = clip,
+                onCancel = { onSetClipboard(null) },
+                onPaste = {
+                    scope.launch {
+                        val r = if (clip.mode == ClipMode.COPY) {
+                            FileRepository.copyInto(clip.entry.path, dir)
+                        } else {
+                            FileRepository.moveInto(clip.entry.path, dir)
+                        }
+                        toast(r.message)
+                        if (r.success) {
+                            onSetClipboard(null)
+                            onChanged()
+                        }
+                    }
+                }
+            )
+        }
+    }
+
+    val target = sheetTarget
+    if (target != null) {
+        ModalBottomSheet(onDismissRequest = { sheetTarget = null }) {
+            Column(Modifier.navigationBarsPadding().padding(bottom = 8.dp)) {
+                Text(
+                    target.name,
+                    style = MaterialTheme.typography.titleMedium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp)
+                )
+                HorizontalDivider()
+                if (!target.isDirectory) {
+                    ActionRow(Icons.AutoMirrored.Filled.OpenInNew, "Open") {
+                        sheetTarget = null
+                        onOpenFile(target)
+                    }
+                }
+                ActionRow(Icons.Filled.ContentCopy, "Copy") {
+                    onSetClipboard(Clipboard(target, ClipMode.COPY))
+                    sheetTarget = null
+                    toast("Copied. Open a folder and tap Paste.")
+                }
+                ActionRow(Icons.Filled.DriveFileMove, "Move") {
+                    onSetClipboard(Clipboard(target, ClipMode.MOVE))
+                    sheetTarget = null
+                    toast("Ready to move. Open a folder and tap Paste.")
+                }
+                ActionRow(Icons.Filled.Edit, "Rename") {
+                    dialogTarget = target
+                    dialogKind = DialogKind.RENAME
+                    sheetTarget = null
+                }
+                ActionRow(Icons.Filled.Delete, "Delete") {
+                    dialogTarget = target
+                    dialogKind = DialogKind.DELETE
+                    sheetTarget = null
+                }
+                ActionRow(Icons.Filled.Info, "Properties") {
+                    dialogTarget = target
+                    dialogKind = DialogKind.PROPERTIES
+                    sheetTarget = null
+                }
+            }
+        }
+    }
+
+    val dTarget = dialogTarget
+    when (dialogKind) {
+        DialogKind.RENAME -> if (dTarget != null) {
+            var text by remember(dTarget) { mutableStateOf(dTarget.name) }
+            AlertDialog(
+                onDismissRequest = { dialogKind = null },
+                title = { Text("Rename") },
+                text = {
+                    OutlinedTextField(
+                        value = text,
+                        onValueChange = { text = it },
+                        singleLine = true,
+                        label = { Text("New name") }
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        scope.launch {
+                            val r = FileRepository.rename(dTarget.path, text)
+                            toast(r.message)
+                            if (r.success) onChanged()
+                        }
+                        dialogKind = null
+                    }) { Text("Rename") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { dialogKind = null }) { Text("Cancel") }
+                }
+            )
+        }
+
+        DialogKind.DELETE -> if (dTarget != null) {
+            AlertDialog(
+                onDismissRequest = { dialogKind = null },
+                icon = { Icon(Icons.Filled.Delete, contentDescription = null) },
+                title = { Text("Delete?") },
+                text = {
+                    Text(
+                        if (dTarget.isDirectory) {
+                            "Delete the folder \"${dTarget.name}\" and everything inside it? This can't be undone."
+                        } else {
+                            "Delete \"${dTarget.name}\"? This can't be undone."
+                        }
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        scope.launch {
+                            val r = FileRepository.delete(dTarget.path)
+                            toast(r.message)
+                            if (r.success) onChanged()
+                        }
+                        dialogKind = null
+                    }) { Text("Delete") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { dialogKind = null }) { Text("Cancel") }
+                }
+            )
+        }
+
+        DialogKind.PROPERTIES -> if (dTarget != null) {
+            val props by produceState<FileProperties?>(initialValue = null, dTarget) {
+                value = FileRepository.computeProperties(dTarget.path)
+            }
+            AlertDialog(
+                onDismissRequest = { dialogKind = null },
+                title = { Text("Properties") },
+                text = {
+                    val p = props
+                    if (p == null) Text("Calculating…") else PropertiesContent(p)
+                },
+                confirmButton = {
+                    TextButton(onClick = { dialogKind = null }) { Text("Close") }
+                }
+            )
+        }
+
+        null -> {}
     }
 }
 
 @Composable
-fun FileRow(entry: FileEntry, onClick: () -> Unit) {
+fun FileRow(entry: FileEntry, onClick: () -> Unit, onMore: () -> Unit) {
     Row(
         Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick)
-            .padding(horizontal = 16.dp, vertical = 12.dp),
+            .padding(start = 16.dp, top = 10.dp, bottom = 10.dp, end = 4.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Icon(
@@ -507,14 +748,130 @@ fun FileRow(entry: FileEntry, onClick: () -> Unit) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
-        if (entry.isDirectory) {
+        IconButton(onClick = onMore) {
             Icon(
-                Icons.Filled.ChevronRight,
-                contentDescription = null,
+                Icons.Filled.MoreVert,
+                contentDescription = "More options",
                 tint = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
     }
+}
+
+@Composable
+fun ActionRow(icon: ImageVector, label: String, onClick: () -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = 20.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(Modifier.width(20.dp))
+        Text(label, style = MaterialTheme.typography.bodyLarge)
+    }
+}
+
+@Composable
+fun PasteBar(clipboard: Clipboard, onCancel: () -> Unit, onPaste: () -> Unit) {
+    Surface(tonalElevation = 3.dp, shadowElevation = 8.dp) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+                .padding(horizontal = 16.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                if (clipboard.mode == ClipMode.COPY) Icons.Filled.ContentCopy else Icons.Filled.DriveFileMove,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary
+            )
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    if (clipboard.mode == ClipMode.COPY) "Copy here" else "Move here",
+                    style = MaterialTheme.typography.labelLarge
+                )
+                Text(
+                    clipboard.entry.name,
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            TextButton(onClick = onCancel) { Text("Cancel") }
+            Spacer(Modifier.width(4.dp))
+            Button(onClick = onPaste) { Text("Paste") }
+        }
+    }
+}
+
+@Composable
+fun PropertiesContent(p: FileProperties) {
+    Column {
+        PropRow("Name", p.name)
+        PropRow("Type", if (p.isDirectory) "Folder" else "File")
+        PropRow("Size", formatSize(p.sizeBytes))
+        if (p.isDirectory) PropRow("Items", p.itemCount.toString())
+        PropRow("Location", p.path)
+        PropRow("Modified", formatDate(p.lastModified).ifEmpty { "—" })
+        PropRow(
+            "Access",
+            (if (p.canRead) "read" else "no read") + " / " + (if (p.canWrite) "write" else "read-only")
+        )
+    }
+}
+
+@Composable
+fun PropRow(label: String, value: String) {
+    Column(Modifier.padding(vertical = 4.dp)) {
+        Text(label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+        Text(value, style = MaterialTheme.typography.bodyMedium)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Small shared pieces
+// ---------------------------------------------------------------------------
+
+@Composable
+fun BrowsePathBar(path: String, onUp: (String) -> Unit) {
+    val parent = remember(path) { File(path).parent }
+    Surface(color = MaterialTheme.colorScheme.surfaceVariant, modifier = Modifier.fillMaxWidth()) {
+        Row(
+            Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(onClick = { parent?.let(onUp) }, enabled = parent != null) {
+                Icon(Icons.Filled.ArrowUpward, contentDescription = "Up one level")
+            }
+            Text(
+                path,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
+@Composable
+fun InfoBar(text: String) {
+    Text(
+        text,
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .padding(horizontal = 16.dp, vertical = 8.dp)
+    )
 }
 
 fun iconFor(entry: FileEntry): ImageVector {

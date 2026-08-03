@@ -19,6 +19,8 @@ import kotlin.math.pow
 
 enum class MediaType { IMAGES, AUDIO, VIDEO }
 
+enum class ClipMode { COPY, MOVE }
+
 data class StorageVolumeInfo(
     val label: String,
     val path: String,
@@ -37,6 +39,21 @@ data class FileEntry(
     val sizeBytes: Long,
     val lastModified: Long
 )
+
+data class FileProperties(
+    val name: String,
+    val path: String,
+    val isDirectory: Boolean,
+    val sizeBytes: Long,
+    val itemCount: Int,
+    val lastModified: Long,
+    val canRead: Boolean,
+    val canWrite: Boolean,
+    val hidden: Boolean
+)
+
+/** Result of a file operation: [success] plus a short message suitable for a toast. */
+data class OpResult(val success: Boolean, val message: String)
 
 object FileRepository {
 
@@ -167,6 +184,108 @@ object FileRepository {
         }
     }
 
+    // ---- File operations -------------------------------------------------
+
+    suspend fun delete(path: String): OpResult = withContext(Dispatchers.IO) {
+        runCatching {
+            if (File(path).deleteRecursively()) OpResult(true, "Deleted")
+            else OpResult(false, "Delete failed")
+        }.getOrElse { OpResult(false, "Delete failed: ${it.message}") }
+    }
+
+    suspend fun rename(path: String, newName: String): OpResult = withContext(Dispatchers.IO) {
+        runCatching {
+            val name = newName.trim()
+            if (name.isEmpty()) return@runCatching OpResult(false, "Name can't be empty")
+            if (name.contains('/')) return@runCatching OpResult(false, "Name can't contain '/'")
+            val f = File(path)
+            val parent = f.parentFile ?: return@runCatching OpResult(false, "No parent folder")
+            val target = File(parent, name)
+            if (target.exists()) return@runCatching OpResult(false, "\"$name\" already exists")
+            if (f.renameTo(target)) OpResult(true, "Renamed") else OpResult(false, "Rename failed")
+        }.getOrElse { OpResult(false, "Rename failed: ${it.message}") }
+    }
+
+    suspend fun copyInto(sourcePath: String, destDirPath: String): OpResult =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val src = File(sourcePath)
+                val destDir = File(destDirPath)
+                if (!src.exists()) return@runCatching OpResult(false, "Source no longer exists")
+                if (!destDir.isDirectory) return@runCatching OpResult(false, "Destination isn't a folder")
+                if (src.isDirectory && isInside(destDir, src)) {
+                    return@runCatching OpResult(false, "Can't copy a folder into itself")
+                }
+                val dest = uniqueDestination(destDir, src.name)
+                src.copyRecursively(dest, overwrite = false)
+                OpResult(true, "Copied to \"${destDir.name}\"")
+            }.getOrElse { OpResult(false, "Copy failed: ${it.message}") }
+        }
+
+    suspend fun moveInto(sourcePath: String, destDirPath: String): OpResult =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val src = File(sourcePath)
+                val destDir = File(destDirPath)
+                if (!src.exists()) return@runCatching OpResult(false, "Source no longer exists")
+                if (!destDir.isDirectory) return@runCatching OpResult(false, "Destination isn't a folder")
+                if (src.isDirectory && isInside(destDir, src)) {
+                    return@runCatching OpResult(false, "Can't move a folder into itself")
+                }
+                if (src.parentFile?.absolutePath == destDir.absolutePath) {
+                    return@runCatching OpResult(false, "Already in this folder")
+                }
+                val dest = uniqueDestination(destDir, src.name)
+                if (src.renameTo(dest)) return@runCatching OpResult(true, "Moved to \"${destDir.name}\"")
+                // Cross-volume fallback: copy then delete the original.
+                src.copyRecursively(dest, overwrite = false)
+                if (src.deleteRecursively()) OpResult(true, "Moved to \"${destDir.name}\"")
+                else OpResult(false, "Copied, but couldn't remove the original")
+            }.getOrElse { OpResult(false, "Move failed: ${it.message}") }
+        }
+
+    suspend fun computeProperties(path: String): FileProperties = withContext(Dispatchers.IO) {
+        val f = File(path)
+        val size = if (f.isDirectory) {
+            f.walkTopDown().filter { it.isFile }.fold(0L) { acc, file -> acc + file.length() }
+        } else {
+            f.length()
+        }
+        val count = if (f.isDirectory) (f.listFiles()?.size ?: 0) else 0
+        FileProperties(
+            name = f.name,
+            path = f.absolutePath,
+            isDirectory = f.isDirectory,
+            sizeBytes = size,
+            itemCount = count,
+            lastModified = f.lastModified(),
+            canRead = f.canRead(),
+            canWrite = f.canWrite(),
+            hidden = f.isHidden
+        )
+    }
+
+    private fun isInside(dir: File, ancestor: File): Boolean {
+        val a = ancestor.absolutePath
+        val d = dir.absolutePath
+        return d == a || d.startsWith("$a/")
+    }
+
+    /** Returns a destination file inside [destDir] that doesn't clash, appending " (n)" if needed. */
+    private fun uniqueDestination(destDir: File, name: String): File {
+        var candidate = File(destDir, name)
+        if (!candidate.exists()) return candidate
+        val hasExt = name.contains('.') && !name.startsWith('.')
+        val base = if (hasExt) name.substringBeforeLast('.') else name
+        val ext = if (hasExt) "." + name.substringAfterLast('.') else ""
+        var i = 1
+        while (candidate.exists()) {
+            candidate = File(destDir, "$base ($i)$ext")
+            i++
+        }
+        return candidate
+    }
+
     private fun guessMime(name: String): String {
         val ext = name.substringAfterLast('.', "").lowercase(Locale.getDefault())
         return MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "*/*"
@@ -182,5 +301,5 @@ fun formatSize(bytes: Long): String {
 
 fun formatDate(millis: Long): String {
     if (millis <= 0) return ""
-    return SimpleDateFormat("dd MMM yyyy", Locale.getDefault()).format(Date(millis))
+    return SimpleDateFormat("dd MMM yyyy, HH:mm", Locale.getDefault()).format(Date(millis))
 }
